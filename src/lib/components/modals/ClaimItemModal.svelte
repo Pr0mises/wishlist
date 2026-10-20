@@ -1,250 +1,239 @@
-<script lang="ts">
-    import { SystemUsersAPI } from "$lib/api/users";
-    import type { ItemOnListDTO } from "$lib/dtos/item-dto";
-    import { ListItemAPI } from "$lib/api/lists";
-    import { ClaimAPI } from "$lib/api/claims";
-    import { getFormatter } from "$lib/i18n";
-    import { toaster } from "../toaster";
-    import BaseModal, { type BaseModalProps } from "./BaseModal.svelte";
-    import { Dialog } from "@skeletonlabs/skeleton-svelte";
+import { client } from "./prisma";
 
-    interface Props extends Omit<BaseModalProps, "title" | "description" | "actions" | "children" | "element"> {
-        item: ItemOnListDTO;
-        userId: string | undefined;
-        groupId: string;
-        requireClaimEmail: boolean;
-        claimId?: string;
-        onSuccess?: VoidFunction;
-        onFailure?: VoidFunction;
-        claimName?: string;
-        alwaysShow?: boolean;
+const GLOBAL = "global";
+
+enum ConfigKey {
+    SIGNUP_ENABLE = "enableSignup",
+    SUGGESTIONS_ENABLE = "suggestions.enable",
+    SUGGESTIONS_METHOD = "suggestions.method",
+    SMTP_ENABLE = "smtp.enable",
+    SMTP_HOST = "smtp.host",
+    SMTP_PORT = "smtp.port",
+    SMTP_USER = "smtp.user",
+    SMTP_PASS = "smtp.pass",
+    SMTP_FROM = "smtp.from",
+    SMTP_FROM_NAME = "smtp.fromName",
+    SMTP_USE_TLS = "smtp.useTls",
+    SMTP_IGNORE_CERT_CHECK = "smtp.ignoreCertCheck",
+    CLAIMS_SHOW_NAME = "claims.showName",
+    ClAIMS_SHOW_NAME_ACROSS_GROUPS = "claims.showNameAcrossGroups",
+    CLAIMS_SHOW_FOR_OWNER = "claims.showForOwner",
+    CLAIMS_SHOW_NAME_PUBLIC = "claims.showNamePublic",
+    CLAIMS_REQUIRE_EMAIL = "claims.requireEmail",
+    LIST_MODE = "listMode",
+    SECURITY_PASSWORD_STRENGTH = "security.passwordStrength",
+    SECURITY_DISABLE_PASSWORD_LOGIN = "security.disablePasswordLogin",
+    DEFAULT_GROUP = "defaultGroup",
+    ENABLE_DEFAULT_LIST_CREATION = "enableDefaultListCreation",
+    ALLOW_PUBLIC_LISTS = "allowPublicLists",
+    OIDC_ENABLE = "oidc.enable",
+    OIDC_DISCOVERY_URL = "oidc.discoveryUrl",
+    OIDC_CLIENT_ID = "oidc.clientId",
+    OIDC_CLIENT_SECRET = "oidc.clientSecret",
+    OIDC_PROVIDER_NAME = "oidc.providerName",
+    OIDC_AUTO_REDIRECT = "oidc.autoRedirect",
+    OIDC_AUTO_REGISTER = "oidc.autoRegister",
+    OIDC_ENABLE_SYNC = "oidc.enableSync",
+    OIDC_DISABLE_EMAIL_VERIFICATION = "oidc.disableEmailVerification",
+    OIDC_NAME_CLAIM = "oidc.nameClaim",
+    OIDC_USERNAME_CLAIM = "oidc.usernameClaim"
+}
+
+type Transformer<T> = (val: string | null, shouldMask?: boolean) => T;
+
+const isDefined = (val: string | null | undefined) => val !== null && val !== undefined;
+const booleanTransformer: Transformer<boolean | undefined> = (val) =>
+    val === "true" ? true : val === "false" ? false : undefined;
+const stringTransformer: Transformer<string | undefined> = (val) => val ?? undefined;
+const maskableStringTransformer: Transformer<string | undefined> = (val, shouldMask = false) =>
+    isDefined(val) ? maskable(val, shouldMask) : undefined;
+const numberTransformer: Transformer<number | undefined> = (val) => (isDefined(val) ? Number(val) : undefined);
+
+const transformers: Record<ConfigKey, Transformer<unknown>> = {
+    enableSignup: booleanTransformer,
+    "suggestions.enable": booleanTransformer,
+    "suggestions.method": stringTransformer,
+    "smtp.enable": booleanTransformer,
+    "smtp.host": stringTransformer,
+    "smtp.port": numberTransformer,
+    "smtp.user": stringTransformer,
+    "smtp.pass": maskableStringTransformer,
+    "smtp.from": stringTransformer,
+    "smtp.fromName": stringTransformer,
+    "smtp.useTls": booleanTransformer,
+    "smtp.ignoreCertCheck": booleanTransformer,
+    "claims.showName": booleanTransformer,
+    "claims.showNameAcrossGroups": booleanTransformer,
+    "claims.showForOwner": booleanTransformer,
+    "claims.showNamePublic": booleanTransformer,
+    "claims.requireEmail": booleanTransformer,
+    listMode: stringTransformer,
+    "security.passwordStrength": numberTransformer,
+    "security.disablePasswordLogin": booleanTransformer,
+    defaultGroup: stringTransformer,
+    enableDefaultListCreation: booleanTransformer,
+    allowPublicLists: booleanTransformer,
+    "oidc.enable": booleanTransformer,
+    "oidc.clientId": stringTransformer,
+    "oidc.clientSecret": maskableStringTransformer,
+    "oidc.discoveryUrl": stringTransformer,
+    "oidc.providerName": stringTransformer,
+    "oidc.autoRedirect": booleanTransformer,
+    "oidc.autoRegister": booleanTransformer,
+    "oidc.enableSync": booleanTransformer,
+    "oidc.disableEmailVerification": booleanTransformer,
+    "oidc.nameClaim": stringTransformer,
+    "oidc.usernameClaim": stringTransformer
+};
+
+const getDefaultConfig = (): Config => ({
+    enableSignup: true,
+    suggestions: {
+        enable: true,
+        method: "approval"
+    },
+    smtp: {
+        enable: false,
+        useTls: false,
+        ignoreCertCheck: false
+    },
+    claims: {
+        showName: true,
+        showNameAcrossGroups: false,
+        showForOwner: false,
+        showNamePublic: false,
+        requireEmail: false
+    },
+    listMode: "standard",
+    security: {
+        passwordStrength: 2,
+        disablePasswordLogin: false
+    },
+    enableDefaultListCreation: true,
+    allowPublicLists: false,
+    oidc: {
+        enable: false
+    }
+});
+
+function buildConfig(configMap: Record<string, string | null>, includeSensitive = false): Config {
+    const config: Partial<Config> = {};
+
+    for (const [key, value] of Object.entries(configMap)) {
+        if (key in transformers) {
+            const transformer: Transformer<unknown> = transformers[key as ConfigKey];
+            const path = key.split(".");
+            setDeep(config, path, transformer(value, !includeSensitive));
+        }
     }
 
-    let {
-        item,
-        userId,
-        groupId,
-        claimId,
-        requireClaimEmail,
-        onSuccess,
-        onFailure,
-        trigger: inputTrigger,
-        claimName,
-        alwaysShow = false,
-        ...rest
-    }: Props = $props();
+    return deepMerge(getDefaultConfig(), config) as Config;
+}
 
-    const t = getFormatter();
-    let open = $state(false);
+function setDeep(obj: Record<string, any>, path: string[], value: any) {
+    let current = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+        if (!(path[i] in current)) current[path[i]] = {};
+        current = current[path[i]];
+    }
+    current[path[path.length - 1]] = value;
+}
 
-    const claim = $derived(item.claims.find((claim) => claim.claimId === claimId));
+function deepMerge(target: Record<string, any>, source: Record<string, any>): Record<string, unknown> {
+    for (const key in source) {
+        if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key])) {
+            if (!target[key]) target[key] = {};
+            deepMerge(target[key], source[key]);
+        } else {
+            target[key] = source[key];
+        }
+    }
+    return target;
+}
 
-    let title = $derived(
-        claim
-            ? claimName
-                ? $t("wishes.update-claim-for-name", { values: { name: claimName } })
-                : $t("wishes.update-claim")
-            : $t("wishes.claim-item")
+function flatten(
+    obj: Record<string, any>,
+    prefix = "",
+    result: Record<string, string | null | undefined> = {}
+): Record<string, string | null | undefined> {
+    for (const [key, value] of Object.entries(obj)) {
+        const fullKey = prefix ? `${prefix}.${key}` : key;
+
+        if (value === null || value === undefined) {
+            result[fullKey] = value;
+        } else if (typeof value === "object" && !Array.isArray(value)) {
+            flatten(value, fullKey, result);
+        } else if (typeof value === "number" || typeof value === "boolean") {
+            result[fullKey] = value.toString();
+        } else {
+            result[fullKey] = value;
+        }
+    }
+    return result;
+}
+
+export const getConfig = async (groupId?: string, includeSensitive = false): Promise<Config> => {
+    const configItems = await client.systemConfig.findMany({
+        where: {
+            groupId: "global"
+        }
+    });
+
+    let configMap: Record<string, string | null> = {};
+    for (const { key, value } of configItems) {
+        configMap[key] = value;
+    }
+
+    let groupConfigMap: Record<string, string | null> = {};
+    if (groupId) groupConfigMap = await getGroupConfig(groupId);
+    configMap = {
+        ...configMap,
+        ...groupConfigMap
+    };
+
+    return buildConfig(configMap, includeSensitive);
+};
+
+const getGroupConfig = async (groupId: string): Promise<Record<string, string | null>> => {
+    const configItems = await client.systemConfig.findMany({
+        where: {
+            groupId
+        }
+    });
+
+    const configMap: Record<string, string | null> = {};
+    for (const { key, value } of configItems) {
+        configMap[key] = value;
+    }
+
+    return configMap;
+};
+
+export const writeConfig = async (config: Partial<Config>, groupId = GLOBAL) => {
+    const configMap: Record<string, string | null | undefined> = flatten(config);
+
+    await client.$transaction(
+        Object.entries(configMap).map(([key, value]) =>
+            client.systemConfig.upsert({
+                where: {
+                    key_groupId: {
+                        key,
+                        groupId
+                    }
+                },
+                create: {
+                    key,
+                    groupId,
+                    value
+                },
+                update: {
+                    value
+                }
+            })
+        )
     );
-    let username: string | undefined = $state();
-    let name: string | undefined = $state();
-    let quantity = $derived(claim?.quantity || 1);
-    let error: string | undefined = $state();
+};
 
-    async function handleTrigger(e: MouseEvent) {
-        e.stopPropagation();
-        if (!userId || alwaysShow) {
-            open = true;
-            return;
-        }
-        if (claim && item.quantity === 1 && claim.quantity === 1) {
-            return onUnclaim();
-        }
-        if (!claim && item.remainingQuantity === 1) {
-            quantity = 1;
-            return onFormSubmit();
-        }
-        open = true;
-    }
-
-    async function onUnclaim() {
-        quantity = 0;
-        return onFormSubmit();
-    }
-
-    async function onFormSubmit() {
-        if (quantity > item.remainingQuantity + (claim?.quantity || 0)) {
-            error = $t("errors.could-not-claim-quantity-items", {
-                values: { quantity, availableQuantity: item.remainingQuantity }
-            });
-            return;
-        }
-
-        if (userId) {
-            if (claim) {
-                handleUpdateClaim(claim.claimId);
-            } else {
-                handleUserClaim(userId);
-            }
-        } else {
-            handlePublicClaim();
-        }
-    }
-
-    async function handleUpdateClaim(claimId: string) {
-        const claimAPI = new ClaimAPI(claimId);
-        const resp = await claimAPI.updateQuantity(quantity);
-        if (resp.ok) {
-            let description;
-            if (quantity === 0) {
-                description = $t("wishes.claimed-item", { values: { claimed: false } });
-            } else {
-                description = $t("wishes.updated-claim");
-            }
-            closeAndToast(description);
-        } else {
-            const respData = await resp.json();
-            errorAndToast(respData?.message);
-        }
-    }
-
-    async function handleUserClaim(userId: string) {
-        const listItemAPI = new ListItemAPI(item.list.id, item.id);
-        const resp = await listItemAPI.claim(userId, quantity);
-
-        if (resp.ok) {
-            closeAndToast($t("wishes.claimed-item", { values: { claimed: true } }));
-        } else {
-            const respData = await resp.json();
-            errorAndToast(respData?.message);
-        }
-    }
-
-    async function handlePublicClaim() {
-        const systemUsersAPI = new SystemUsersAPI(groupId);
-        const userResp = await systemUsersAPI.create(username, name);
-        if (!userResp.ok) {
-            const responseData = await userResp.json();
-            errorAndToast(responseData?.message);
-            return;
-        }
-        const { id: publicUserId } = await userResp.json();
-
-        const listItemAPI = new ListItemAPI(item.list.id, item.id);
-        const resp = await listItemAPI.claimPublic(publicUserId, quantity);
-
-        if (resp.ok) {
-            closeAndToast($t("wishes.claimed-item", { values: { claimed: true } }));
-        } else {
-            const respData = await resp.json();
-            errorAndToast(respData?.message);
-        }
-    }
-
-    function errorAndToast(message?: string) {
-        onFailure?.();
-        toaster.error({ description: message || $t("general.oops") });
-    }
-
-    function closeAndToast(description: string) {
-        // wait for transition to finish before triggering toast
-        setTimeout(() => toaster.info({ description }), open ? 275 : 0);
-        open = false;
-
-        onSuccess?.();
-    }
-</script>
-
-{#snippet description()}
-    {#if !userId}
-        <span>{$t("wishes.before-you-can-claim-the-item-we-just-need-one-thing-from-you")}</span>
-    {/if}
-{/snippet}
-
-<BaseModal {description} onOpenChange={(e) => (open = e.open)} {open} {title} {...rest}>
-    {#snippet trigger(props)}
-        {@render inputTrigger({ ...props, onclick: handleTrigger })}
-    {/snippet}
-
-    {#if !userId}
-        <div class="flex flex-col gap-2">
-            <label class="label w-fit">
-                <span>{$t("general.name-optional")}</span>
-                <div class="input-group grid-cols-[auto_1fr_auto]">
-                    <div class="ig-cell preset-tonal">
-                        <iconify-icon class="text-lg" icon="ion:person"></iconify-icon>
-                    </div>
-                    <input class="ig-input" type="text" bind:value={name} />
-                </div>
-            </label>
-
-            {#if requireClaimEmail}
-                <label class="label w-fit">
-                    <span>{$t("auth.email")}</span>
-                    <div class="input-group grid-cols-[auto_1fr_auto]">
-                        <div class="ig-cell preset-tonal">
-                            <iconify-icon class="text-lg" icon="ion:person"></iconify-icon>
-                        </div>
-                        <input class="ig-input" required type="email" bind:value={username} />
-                    </div>
-                </label>
-            {/if}
-        </div>
-    {/if}
-
-    {#if item.remainingQuantity > 1 || claim}
-        <div class="flex flex-col gap-1">
-            <label class="label w-fit">
-                <span>{$t("wishes.enter-the-quantity-to-claim")}</span>
-                <input
-                    class={["input", error && "input-invalid"]}
-                    inputmode="numeric"
-                    max={item.remainingQuantity + (claim?.quantity || 0)}
-                    min={claim ? 0 : 1}
-                    required
-                    step="1"
-                    type="number"
-                    bind:value={quantity}
-                />
-            </label>
-            {#if error}
-                <span class="text-invalid">{error}</span>
-            {/if}
-            {#if claim}
-                <span class="subtext">
-                    {#if claimName}
-                        {$t("wishes.claimed-info-text-for-name", {
-                            values: { claimedQuantity: claim.quantity, name: claimName }
-                        })}
-                    {:else}
-                        {$t("wishes.claimed-info-text", {
-                            values: { claimedQuantity: claim.quantity }
-                        })}
-                    {/if}
-                    {#if item.quantity}
-                        {$t("wishes.additional-items-requested", {
-                            values: { remainingQuantity: item.remainingQuantity }
-                        })}
-                    {/if}
-                </span>
-            {/if}
-        </div>
-    {/if}
-
-    {#snippet actions({ neutralStyle, negativeStyle, positiveStyle })}
-        <Dialog.CloseTrigger class={neutralStyle} type="button">
-            {$t("general.cancel")}
-        </Dialog.CloseTrigger>
-
-        <div class="flex flex-wrap gap-2">
-            {#if claim}
-                <button class={negativeStyle} onclick={onUnclaim} type="button">
-                    {$t("wishes.unclaim")}
-                </button>
-            {/if}
-            <button class={positiveStyle} onclick={onFormSubmit} type="button">
-                {$t("wishes.claim")}
-            </button>
-        </div>
-    {/snippet}
-</BaseModal>
+const maskable = (value: string, mask: boolean) => {
+    return mask ? "*****" : value;
+};

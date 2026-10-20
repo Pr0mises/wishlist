@@ -1,239 +1,157 @@
-import { client } from "./prisma";
+import { getFormatter } from "$lib/server/i18n";
+import { itemEmitter } from "$lib/server/events/emitters";
+import { client } from "$lib/server/prisma";
+import type { RequestHandler } from "./$types";
+import { error } from "@sveltejs/kit";
+import { listItemClaimSchema } from "$lib/server/validations";
+import type { Prisma } from "$lib/generated/prisma/client";
+import { getItemInclusions } from "$lib/server/items";
+import { ItemEvent } from "$lib/events";
+import { logger } from "$lib/server/logger";
+import z from "zod";
+import { getActiveMembership } from "$lib/server/group-membership";
 
-const GLOBAL = "global";
+// Claim an item on a list
+export const PUT: RequestHandler = async ({ locals, request, params }) => {
+    const $t = await getFormatter();
 
-enum ConfigKey {
-    SIGNUP_ENABLE = "enableSignup",
-    SUGGESTIONS_ENABLE = "suggestions.enable",
-    SUGGESTIONS_METHOD = "suggestions.method",
-    SMTP_ENABLE = "smtp.enable",
-    SMTP_HOST = "smtp.host",
-    SMTP_PORT = "smtp.port",
-    SMTP_USER = "smtp.user",
-    SMTP_PASS = "smtp.pass",
-    SMTP_FROM = "smtp.from",
-    SMTP_FROM_NAME = "smtp.fromName",
-    SMTP_USE_TLS = "smtp.useTls",
-    SMTP_IGNORE_CERT_CHECK = "smtp.ignoreCertCheck",
-    CLAIMS_SHOW_NAME = "claims.showName",
-    ClAIMS_SHOW_NAME_ACROSS_GROUPS = "claims.showNameAcrossGroups",
-    CLAIMS_SHOW_FOR_OWNER = "claims.showForOwner",
-    CLAIMS_SHOW_NAME_PUBLIC = "claims.showNamePublic",
-    CLAIMS_REQUIRE_EMAIL = "claims.requireEmail",
-    LIST_MODE = "listMode",
-    SECURITY_PASSWORD_STRENGTH = "security.passwordStrength",
-    SECURITY_DISABLE_PASSWORD_LOGIN = "security.disablePasswordLogin",
-    DEFAULT_GROUP = "defaultGroup",
-    ENABLE_DEFAULT_LIST_CREATION = "enableDefaultListCreation",
-    ALLOW_PUBLIC_LISTS = "allowPublicLists",
-    OIDC_ENABLE = "oidc.enable",
-    OIDC_DISCOVERY_URL = "oidc.discoveryUrl",
-    OIDC_CLIENT_ID = "oidc.clientId",
-    OIDC_CLIENT_SECRET = "oidc.clientSecret",
-    OIDC_PROVIDER_NAME = "oidc.providerName",
-    OIDC_AUTO_REDIRECT = "oidc.autoRedirect",
-    OIDC_AUTO_REGISTER = "oidc.autoRegister",
-    OIDC_ENABLE_SYNC = "oidc.enableSync",
-    OIDC_DISABLE_EMAIL_VERIFICATION = "oidc.disableEmailVerification",
-    OIDC_NAME_CLAIM = "oidc.nameClaim",
-    OIDC_USERNAME_CLAIM = "oidc.usernameClaim"
-}
-
-type Transformer<T> = (val: string | null, shouldMask?: boolean) => T;
-
-const isDefined = (val: string | null | undefined) => val !== null && val !== undefined;
-const booleanTransformer: Transformer<boolean | undefined> = (val) =>
-    val === "true" ? true : val === "false" ? false : undefined;
-const stringTransformer: Transformer<string | undefined> = (val) => val ?? undefined;
-const maskableStringTransformer: Transformer<string | undefined> = (val, shouldMask = false) =>
-    isDefined(val) ? maskable(val, shouldMask) : undefined;
-const numberTransformer: Transformer<number | undefined> = (val) => (isDefined(val) ? Number(val) : undefined);
-
-const transformers: Record<ConfigKey, Transformer<unknown>> = {
-    enableSignup: booleanTransformer,
-    "suggestions.enable": booleanTransformer,
-    "suggestions.method": stringTransformer,
-    "smtp.enable": booleanTransformer,
-    "smtp.host": stringTransformer,
-    "smtp.port": numberTransformer,
-    "smtp.user": stringTransformer,
-    "smtp.pass": maskableStringTransformer,
-    "smtp.from": stringTransformer,
-    "smtp.fromName": stringTransformer,
-    "smtp.useTls": booleanTransformer,
-    "smtp.ignoreCertCheck": booleanTransformer,
-    "claims.showName": booleanTransformer,
-    "claims.showNameAcrossGroups": booleanTransformer,
-    "claims.showForOwner": booleanTransformer,
-    "claims.showNamePublic": booleanTransformer,
-    "claims.requireEmail": booleanTransformer,
-    listMode: stringTransformer,
-    "security.passwordStrength": numberTransformer,
-    "security.disablePasswordLogin": booleanTransformer,
-    defaultGroup: stringTransformer,
-    enableDefaultListCreation: booleanTransformer,
-    allowPublicLists: booleanTransformer,
-    "oidc.enable": booleanTransformer,
-    "oidc.clientId": stringTransformer,
-    "oidc.clientSecret": maskableStringTransformer,
-    "oidc.discoveryUrl": stringTransformer,
-    "oidc.providerName": stringTransformer,
-    "oidc.autoRedirect": booleanTransformer,
-    "oidc.autoRegister": booleanTransformer,
-    "oidc.enableSync": booleanTransformer,
-    "oidc.disableEmailVerification": booleanTransformer,
-    "oidc.nameClaim": stringTransformer,
-    "oidc.usernameClaim": stringTransformer
-};
-
-const getDefaultConfig = (): Config => ({
-    enableSignup: true,
-    suggestions: {
-        enable: true,
-        method: "approval"
-    },
-    smtp: {
-        enable: false,
-        useTls: false,
-        ignoreCertCheck: false
-    },
-    claims: {
-        showName: true,
-        showNameAcrossGroups: false,
-        showForOwner: false,
-        showNamePublic: false,
-        requireEmail: true
-    },
-    listMode: "standard",
-    security: {
-        passwordStrength: 2,
-        disablePasswordLogin: false
-    },
-    enableDefaultListCreation: true,
-    allowPublicLists: false,
-    oidc: {
-        enable: false
-    }
-});
-
-function buildConfig(configMap: Record<string, string | null>, includeSensitive = false): Config {
-    const config: Partial<Config> = {};
-
-    for (const [key, value] of Object.entries(configMap)) {
-        if (key in transformers) {
-            const transformer: Transformer<unknown> = transformers[key as ConfigKey];
-            const path = key.split(".");
-            setDeep(config, path, transformer(value, !includeSensitive));
-        }
+    const itemId = parseInt(params.itemId);
+    if (isNaN(itemId)) {
+        error(400, $t("errors.item-id-must-be-a-number"));
     }
 
-    return deepMerge(getDefaultConfig(), config) as Config;
-}
+    const body = (await request.json()) as Record<string, unknown>[];
+    const updateData = listItemClaimSchema.safeParse(body);
 
-function setDeep(obj: Record<string, any>, path: string[], value: any) {
-    let current = obj;
-    for (let i = 0; i < path.length - 1; i++) {
-        if (!(path[i] in current)) current[path[i]] = {};
-        current = current[path[i]];
+    if (updateData.error) {
+        error(422, JSON.stringify(z.flattenError(updateData.error).fieldErrors));
     }
-    current[path[path.length - 1]] = value;
-}
-
-function deepMerge(target: Record<string, any>, source: Record<string, any>): Record<string, unknown> {
-    for (const key in source) {
-        if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key])) {
-            if (!target[key]) target[key] = {};
-            deepMerge(target[key], source[key]);
-        } else {
-            target[key] = source[key];
-        }
+    if (!updateData.data.claimedById && !updateData.data.publicClaimedById) {
+        error(400, $t("errors.claimed-by-user-must-be-specified"));
     }
-    return target;
-}
 
-function flatten(
-    obj: Record<string, any>,
-    prefix = "",
-    result: Record<string, string | null | undefined> = {}
-): Record<string, string | null | undefined> {
-    for (const [key, value] of Object.entries(obj)) {
-        const fullKey = prefix ? `${prefix}.${key}` : key;
-
-        if (value === null || value === undefined) {
-            result[fullKey] = value;
-        } else if (typeof value === "object" && !Array.isArray(value)) {
-            flatten(value, fullKey, result);
-        } else if (typeof value === "number" || typeof value === "boolean") {
-            result[fullKey] = value.toString();
-        } else {
-            result[fullKey] = value;
-        }
-    }
-    return result;
-}
-
-export const getConfig = async (groupId?: string, includeSensitive = false): Promise<Config> => {
-    const configItems = await client.systemConfig.findMany({
+    const list = await client.list.findUnique({
+        select: {
+            id: true,
+            public: true,
+            groupId: true,
+            allowSelfClaims: true,
+            notForMe: true,
+            ownerId: true
+        },
         where: {
-            groupId: "global"
+            id: params.listId
         }
     });
 
-    let configMap: Record<string, string | null> = {};
-    for (const { key, value } of configItems) {
-        configMap[key] = value;
+    if (!list) {
+        error(404, $t("errors.list-not-found"));
     }
 
-    let groupConfigMap: Record<string, string | null> = {};
-    if (groupId) groupConfigMap = await getGroupConfig(groupId);
-    configMap = {
-        ...configMap,
-        ...groupConfigMap
-    };
-
-    return buildConfig(configMap, includeSensitive);
-};
-
-const getGroupConfig = async (groupId: string): Promise<Record<string, string | null>> => {
-    const configItems = await client.systemConfig.findMany({
-        where: {
-            groupId
+    if (updateData.data.claimedById !== undefined && updateData.data.claimedById !== null) {
+        if (!locals.user) {
+            error(401, $t("errors.unauthenticated"));
+        } else if (locals.user.id !== updateData.data.claimedById) {
+            error(403, $t("errors.no-claim-on-behalf-of"));
         }
-    });
-
-    const configMap: Record<string, string | null> = {};
-    for (const { key, value } of configItems) {
-        configMap[key] = value;
+    }
+    if (updateData.data.publicClaimedById && !list.public) {
+        error(404, $t("errors.list-not-found"));
     }
 
-    return configMap;
-};
+    const isSelfClaimable = list.allowSelfClaims || list.notForMe;
+    if (updateData.data.claimedById === list.ownerId && !isSelfClaimable) {
+        error(400, $t("errors.this-list-does-not-allow-self-claimed-items"));
+    }
 
-export const writeConfig = async (config: Partial<Config>, groupId = GLOBAL) => {
-    const configMap: Record<string, string | null | undefined> = flatten(config);
-
-    await client.$transaction(
-        Object.entries(configMap).map(([key, value]) =>
-            client.systemConfig.upsert({
-                where: {
-                    key_groupId: {
-                        key,
-                        groupId
-                    }
-                },
-                create: {
-                    key,
-                    groupId,
-                    value
-                },
-                update: {
-                    value
+    const item = await client.item.findUnique({
+        select: {
+            id: true,
+            quantity: true,
+            claims: {
+                select: {
+                    quantity: true
                 }
+            }
+        },
+        where: {
+            id: itemId,
+            lists: {
+                some: {
+                    listId: list.id
+                }
+            }
+        }
+    });
+
+    if (!item) {
+        error(404, $t("errors.item-not-found-on-list"));
+    }
+
+    if (locals.user) {
+        const activeGroupId = (await getActiveMembership(locals.user)).groupId;
+        if (activeGroupId !== list.groupId) {
+            error(403, $t("errors.this-list-is-not-part-of-your-active-group"));
+        }
+    }
+
+    const claimedQuantity = item.claims.reduce((a, { quantity }) => a + quantity, 0);
+    if (item.quantity !== null && claimedQuantity + updateData.data.quantity > item.quantity) {
+        error(
+            422,
+            $t("errors.could-not-claim-quantity-items", {
+                values: { quantity: updateData.data.quantity, availableQuantity: item.quantity - claimedQuantity }
             })
-        )
-    );
+        );
+    }
+
+    try {
+        const data: Prisma.ItemClaimCreateInput = {
+            item: {
+                connect: {
+                    id: item.id
+                }
+            },
+            list: {
+                connect: {
+                    id: list.id
+                }
+            },
+            quantity: updateData.data.quantity
+        };
+        if (updateData.data.claimedById) {
+            data.claimedBy = {
+                connect: {
+                    id: updateData.data.claimedById
+                }
+            };
+        } else if (updateData.data.publicClaimedById) {
+            data.publicClaimedBy = {
+                connect: {
+                    id: updateData.data.publicClaimedById
+                }
+            };
+        }
+
+        const createdClaim = await client.itemClaim.create({ data });
+        const updatedItem = await client.item.findUnique({
+            where: {
+                id: item.id
+            },
+            include: getItemInclusions()
+        });
+        if (updatedItem) itemEmitter.emit(ItemEvent.ITEM_UPDATE, updatedItem);
+
+        return new Response(JSON.stringify({ claimId: createdClaim.id }), {
+            status: 200,
+            headers: {
+                "content-type": "application/json"
+            }
+        });
+    } catch (err) {
+        logger.error({ err }, "Error claiming item");
+        error(422, $t("general.oops"));
+    }
 };
 
-const maskable = (value: string, mask: boolean) => {
-    return mask ? "*****" : value;
-};
+            \n
