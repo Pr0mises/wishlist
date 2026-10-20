@@ -1,160 +1,161 @@
-import { listItemClaimUpdateSchema } from "$lib/server/validations";
+import { getFormatter } from "$lib/server/i18n";
+import { itemEmitter } from "$lib/server/events/emitters";
+import { client } from "$lib/server/prisma";
+import type { RequestHandler } from "./$types";
+import { error } from "@sveltejs/kit";
+import { listItemClaimSchema } from "$lib/server/validations";
+import type { Prisma } from "$lib/generated/prisma/client";
+import { getItemInclusions } from "$lib/server/items";
 import { ItemEvent } from "$lib/events";
-import { requireLoginOrError } from "$lib/server/auth";
 import { logger } from "$lib/server/logger";
 import z from "zod";
-import type { ItemClaimModel, ItemModel } from "$lib/generated/prisma/models";
+import { getActiveMembership } from "$lib/server/group-membership";
+import { createPublicClaimUnclaimToken } from "$lib/server/public-claim-token";
 
-// Unclaim an item on a list
-export const DELETE: RequestHandler = async ({ locals, params }) => {
-    const user = locals.user ?? null;
-    const claim = user ? await findClaim(params.claimId, user) : await findPublicClaim(params.claimId);
-
-    return deleteClaim(claim);
-};
-
-// Update a claim -- set or unset purchased
-export const PATCH: RequestHandler = async ({ request, params }) => {
-    const user = await requireLoginOrError();
+// Claim an item on a list
+export const PUT: RequestHandler = async ({ locals, request, params }) => {
     const $t = await getFormatter();
 
-    const claim = await findClaim(params.claimId, user);
-    const updateData = await request.json().then((d) => listItemClaimUpdateSchema.safeParse(d));
+    const itemId = parseInt(params.itemId);
+    if (isNaN(itemId)) {
+        error(400, $t("errors.item-id-must-be-a-number"));
+    }
+
+    const body = (await request.json()) as Record<string, unknown>[];
+    const updateData = listItemClaimSchema.safeParse(body);
 
     if (updateData.error) {
         error(422, JSON.stringify(z.flattenError(updateData.error).fieldErrors));
     }
-
-    try {
-        if (updateData.data?.quantity === 0) {
-            return deleteClaim(claim);
-        }
-
-        if (
-            (updateData.data.purchased !== null && updateData.data.purchased !== undefined) ||
-            updateData.data.quantity
-        ) {
-            await client.itemClaim.update({
-                data: {
-                    purchased:
-                        updateData.data.purchased !== null && updateData.data.purchased !== undefined
-                            ? updateData.data.purchased
-                            : undefined,
-                    quantity: updateData.data.quantity ?? undefined
-                },
-                where: {
-                    id: claim.id
-                }
-            });
-            const updatedItem = await client.item.findUnique({
-                where: {
-                    id: claim.item.id
-                },
-                include: getItemInclusions()
-            });
-            if (updatedItem) itemEmitter.emit(ItemEvent.ITEM_UPDATE, updatedItem);
-        }
-        return new Response();
-    } catch (err) {
-        logger.error({ err }, "Unable to update claim");
-        error(500, $t("errors.unable-to-update-claim"));
+    if (!updateData.data.claimedById && !updateData.data.publicClaimedById) {
+        error(400, $t("errors.claimed-by-user-must-be-specified"));
     }
-};
 
-interface ItemClaim extends Pick<ItemClaimModel, "id" | "claimedById" | "publicClaimedById"> {
-    item: Pick<ItemModel, "id" | "userId">;
-}
-
-async function findPublicClaim(claimId: string): Promise<ItemClaim> {
-    const $t = await getFormatter();
-
-    const claim = await client.itemClaim.findUnique({
+    const list = await client.list.findUnique({
         select: {
             id: true,
-            claimedById: true,
-            publicClaimedById: true,
-            item: {
+            public: true,
+            groupId: true,
+            allowSelfClaims: true,
+            notForMe: true,
+            ownerId: true
+        },
+        where: {
+            id: params.listId
+        }
+    });
+
+    if (!list) {
+        error(404, $t("errors.list-not-found"));
+    }
+
+    if (updateData.data.claimedById !== undefined && updateData.data.claimedById !== null) {
+        if (!locals.user) {
+            error(401, $t("errors.unauthenticated"));
+        } else if (locals.user.id !== updateData.data.claimedById) {
+            error(403, $t("errors.no-claim-on-behalf-of"));
+        }
+    }
+    if (updateData.data.publicClaimedById && !list.public) {
+        error(404, $t("errors.list-not-found"));
+    }
+
+    const isSelfClaimable = list.allowSelfClaims || list.notForMe;
+    if (updateData.data.claimedById === list.ownerId && !isSelfClaimable) {
+        error(400, $t("errors.this-list-does-not-allow-self-claimed-items"));
+    }
+
+    const item = await client.item.findUnique({
+        select: {
+            id: true,
+            quantity: true,
+            claims: {
                 select: {
-                    id: true,
-                    userId: true
+                    quantity: true
                 }
             }
         },
         where: {
-            id: claimId
-        }
-    });
-
-    if (!claim) {
-        error(404, $t("errors.claim-was-not-found"));
-    }
-
-    if (!claim.publicClaimedById) {
-        error(403, $t("errors.cannot-update-a-claim-that-is-not-yours"));
-    }
-
-    return claim;
-}
-
-async function findClaim(claimId: string, user?: LocalUser | null): Promise<ItemClaim> {
-    const $t = await getFormatter();
-
-    const claim = await client.itemClaim.findUnique({
-        select: {
-            id: true,
-            claimedById: true,
-            publicClaimedById: true,
-            item: {
-                select: {
-                    id: true,
-                    userId: true
+            id: itemId,
+            lists: {
+                some: {
+                    listId: list.id
                 }
             }
-        },
-        where: {
-            id: claimId
         }
     });
 
-    if (!claim) {
-        error(404, $t("errors.claim-was-not-found"));
+    if (!item) {
+        error(404, $t("errors.item-not-found-on-list"));
     }
 
-    if (!user) {
-        if (!claim.publicClaimedById) {
-            error(403, $t("errors.cannot-update-a-claim-that-is-not-yours"));
+    if (locals.user) {
+        const activeGroupId = (await getActiveMembership(locals.user)).groupId;
+        if (activeGroupId !== list.groupId) {
+            error(403, $t("errors.this-list-is-not-part-of-your-active-group"));
         }
-        return claim;
     }
 
-    if (claim.claimedById !== user.id && user.id !== claim.item.userId) {
-        error(403, $t("errors.cannot-update-a-claim-that-is-not-yours"));
+    const claimedQuantity = item.claims.reduce((a, { quantity }) => a + quantity, 0);
+    if (item.quantity !== null && claimedQuantity + updateData.data.quantity > item.quantity) {
+        error(
+            422,
+            $t("errors.could-not-claim-quantity-items", {
+                values: { quantity: updateData.data.quantity, availableQuantity: item.quantity - claimedQuantity }
+            })
+        );
     }
-
-    return claim;
-}
-
-async function deleteClaim(claim: ItemClaim) {
-    const $t = await getFormatter();
 
     try {
-        await client.itemClaim.delete({
-            where: {
-                id: claim.id
-            }
-        });
+        const data: Prisma.ItemClaimCreateInput = {
+            item: {
+                connect: {
+                    id: item.id
+                }
+            },
+            list: {
+                connect: {
+                    id: list.id
+                }
+            },
+            quantity: updateData.data.quantity
+        };
+        if (updateData.data.claimedById) {
+            data.claimedBy = {
+                connect: {
+                    id: updateData.data.claimedById
+                }
+            };
+        } else if (updateData.data.publicClaimedById) {
+            data.publicClaimedBy = {
+                connect: {
+                    id: updateData.data.publicClaimedById
+                }
+            };
+        }
 
-        const item = await client.item.findUnique({
+        const createdClaim = await client.itemClaim.create({ data });
+        const updatedItem = await client.item.findUnique({
             where: {
-                id: claim.item.id
+                id: item.id
             },
             include: getItemInclusions()
         });
-        if (item) itemEmitter.emit(ItemEvent.ITEM_UPDATE, item);
+        if (updatedItem) itemEmitter.emit(ItemEvent.ITEM_UPDATE, updatedItem);
 
-        return new Response();
+        const responseBody: Record<string, string> = { claimId: createdClaim.id };
+        if (updateData.data.publicClaimedById) {
+            responseBody.unclaimToken = createPublicClaimUnclaimToken(createdClaim.id, updateData.data.publicClaimedById);
+        }
+
+        return new Response(JSON.stringify(responseBody), {
+            status: 200,
+            headers: {
+                "content-type": "application/json"
+            }
+        });
     } catch (err) {
-        logger.error({ err }, "Unable to unclaim item");
-        error(500, $t("errors.unable-to-unclaim-item"));
+        logger.error({ err }, "Error claiming item");
+        error(422, $t("general.oops"));
     }
-}
+};
