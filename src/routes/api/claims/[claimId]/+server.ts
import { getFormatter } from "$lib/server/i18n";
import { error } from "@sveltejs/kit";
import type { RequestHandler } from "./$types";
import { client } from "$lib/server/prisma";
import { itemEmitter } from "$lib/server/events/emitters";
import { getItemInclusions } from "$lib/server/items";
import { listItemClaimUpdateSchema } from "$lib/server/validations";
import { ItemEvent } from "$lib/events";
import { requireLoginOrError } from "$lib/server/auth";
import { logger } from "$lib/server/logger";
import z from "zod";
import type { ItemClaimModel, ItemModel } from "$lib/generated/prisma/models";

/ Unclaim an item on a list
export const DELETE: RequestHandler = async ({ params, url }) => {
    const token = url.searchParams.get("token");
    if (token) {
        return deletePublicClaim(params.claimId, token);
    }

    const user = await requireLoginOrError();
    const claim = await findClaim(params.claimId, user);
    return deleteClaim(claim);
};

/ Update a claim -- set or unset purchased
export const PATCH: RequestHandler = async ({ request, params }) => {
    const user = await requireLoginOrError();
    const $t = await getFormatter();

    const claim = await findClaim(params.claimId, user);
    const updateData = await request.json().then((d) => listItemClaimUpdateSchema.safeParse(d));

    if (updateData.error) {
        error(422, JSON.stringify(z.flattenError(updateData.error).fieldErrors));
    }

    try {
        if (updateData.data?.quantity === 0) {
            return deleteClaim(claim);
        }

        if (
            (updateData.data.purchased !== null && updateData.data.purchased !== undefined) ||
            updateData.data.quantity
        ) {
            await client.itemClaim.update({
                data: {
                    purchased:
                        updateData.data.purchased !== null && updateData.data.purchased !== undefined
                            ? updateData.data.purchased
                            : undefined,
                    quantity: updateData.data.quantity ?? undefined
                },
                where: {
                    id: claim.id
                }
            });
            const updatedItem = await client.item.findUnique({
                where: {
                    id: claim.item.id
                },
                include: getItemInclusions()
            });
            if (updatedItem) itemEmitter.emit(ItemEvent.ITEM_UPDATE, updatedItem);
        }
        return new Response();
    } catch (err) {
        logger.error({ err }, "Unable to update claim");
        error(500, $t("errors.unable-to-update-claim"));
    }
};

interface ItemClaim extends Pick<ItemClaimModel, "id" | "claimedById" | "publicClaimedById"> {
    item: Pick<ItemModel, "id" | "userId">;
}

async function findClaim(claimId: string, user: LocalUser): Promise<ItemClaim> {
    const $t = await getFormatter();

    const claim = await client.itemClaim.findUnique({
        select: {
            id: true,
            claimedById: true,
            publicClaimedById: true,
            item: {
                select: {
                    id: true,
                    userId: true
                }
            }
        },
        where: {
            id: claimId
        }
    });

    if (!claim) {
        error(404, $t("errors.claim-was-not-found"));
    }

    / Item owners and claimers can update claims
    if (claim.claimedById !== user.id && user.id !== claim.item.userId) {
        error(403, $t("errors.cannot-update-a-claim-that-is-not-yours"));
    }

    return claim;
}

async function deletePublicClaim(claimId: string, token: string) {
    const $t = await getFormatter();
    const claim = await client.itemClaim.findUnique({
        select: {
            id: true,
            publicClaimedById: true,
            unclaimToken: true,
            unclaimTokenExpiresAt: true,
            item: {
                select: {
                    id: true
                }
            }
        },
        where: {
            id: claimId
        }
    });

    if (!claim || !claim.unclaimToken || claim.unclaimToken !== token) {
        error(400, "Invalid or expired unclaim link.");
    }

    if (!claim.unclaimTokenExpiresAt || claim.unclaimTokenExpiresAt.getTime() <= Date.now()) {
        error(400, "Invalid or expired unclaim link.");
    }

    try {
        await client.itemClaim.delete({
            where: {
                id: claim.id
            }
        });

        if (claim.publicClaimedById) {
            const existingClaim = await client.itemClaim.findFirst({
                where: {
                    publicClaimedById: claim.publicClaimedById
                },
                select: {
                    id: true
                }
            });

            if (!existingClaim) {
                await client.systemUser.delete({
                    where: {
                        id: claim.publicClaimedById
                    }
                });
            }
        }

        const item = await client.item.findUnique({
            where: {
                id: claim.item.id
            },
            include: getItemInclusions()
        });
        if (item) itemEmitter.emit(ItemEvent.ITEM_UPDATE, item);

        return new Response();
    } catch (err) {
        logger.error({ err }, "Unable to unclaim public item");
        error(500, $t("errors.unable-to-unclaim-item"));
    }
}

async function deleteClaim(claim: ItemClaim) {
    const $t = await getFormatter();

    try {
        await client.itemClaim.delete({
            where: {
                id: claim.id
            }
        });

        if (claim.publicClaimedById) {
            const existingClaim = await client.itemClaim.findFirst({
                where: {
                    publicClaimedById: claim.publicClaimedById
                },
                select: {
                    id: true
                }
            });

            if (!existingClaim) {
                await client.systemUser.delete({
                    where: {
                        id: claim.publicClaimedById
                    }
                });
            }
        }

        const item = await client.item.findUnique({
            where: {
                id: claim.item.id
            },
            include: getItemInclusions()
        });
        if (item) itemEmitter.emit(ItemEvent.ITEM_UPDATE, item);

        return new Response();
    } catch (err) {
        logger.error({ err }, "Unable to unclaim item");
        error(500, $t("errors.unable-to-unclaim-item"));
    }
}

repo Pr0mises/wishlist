@@ -1,0 +1,189 @@
+import { env } from "$env/dynamic/private";
+import { getConfig } from "$lib/server/config";
+import { sendClaimUnclaimLink } from "$lib/server/email";
+import { getFormatter } from "$lib/server/i18n";
+import { itemEmitter } from "$lib/server/events/emitters";
+import { client } from "$lib/server/prisma";
+import type { RequestHandler } from "./$types";
+import { error } from "@sveltejs/kit";
+import { listItemClaimSchema } from "$lib/server/validations";
+import type { Prisma } from "$lib/generated/prisma/client";
+import { getItemInclusions } from "$lib/server/items";
+import { ItemEvent } from "$lib/events";
+import { logger } from "$lib/server/logger";
+import z from "zod";
+import { getActiveMembership } from "$lib/server/group-membership";
+
+// Claim an item on a list
+export const PUT: RequestHandler = async ({ locals, request, params }) => {
+    const $t = await getFormatter();
+
+    const itemId = parseInt(params.itemId);
+    if (isNaN(itemId)) {
+        error(400, $t("errors.item-id-must-be-a-number"));
+    }
+
+    const body = (await request.json()) as Record<string, unknown>[];
+    const updateData = listItemClaimSchema.safeParse(body);
+
+    if (updateData.error) {
+        error(422, JSON.stringify(z.flattenError(updateData.error).fieldErrors));
+    }
+    if (!updateData.data.claimedById && !updateData.data.publicClaimedById) {
+        error(400, $t("errors.claimed-by-user-must-be-specified"));
+    }
+
+    const list = await client.list.findUnique({
+        select: {
+            id: true,
+            public: true,
+            groupId: true,
+            allowSelfClaims: true,
+            notForMe: true,
+            ownerId: true
+        },
+        where: {
+            id: params.listId
+        }
+    });
+
+    if (!list) {
+        error(404, $t("errors.list-not-found"));
+    }
+
+    const config = await getConfig(list.groupId);
+    const publicUnclaimDays = config.claims.publicUnclaimDays ?? 365;
+
+    if (updateData.data.claimedById !== undefined && updateData.data.claimedById !== null) {
+        if (!locals.user) {
+            error(401, $t("errors.unauthenticated"));
+        } else if (locals.user.id !== updateData.data.claimedById) {
+            error(403, $t("errors.no-claim-on-behalf-of"));
+        }
+    }
+    if (updateData.data.publicClaimedById && !list.public) {
+        error(404, $t("errors.list-not-found"));
+    }
+
+    const isSelfClaimable = list.allowSelfClaims || list.notForMe;
+    if (updateData.data.claimedById === list.ownerId && !isSelfClaimable) {
+        error(400, $t("errors.this-list-does-not-allow-self-claimed-items"));
+    }
+
+    const item = await client.item.findUnique({
+        select: {
+            id: true,
+            quantity: true,
+            claims: {
+                select: {
+                    quantity: true
+                }
+            }
+        },
+        where: {
+            id: itemId,
+            lists: {
+                some: {
+                    listId: list.id
+                }
+            }
+        }
+    });
+
+    if (!item) {
+        error(404, $t("errors.item-not-found-on-list"));
+    }
+
+    if (locals.user) {
+        const activeGroupId = (await getActiveMembership(locals.user)).groupId;
+        if (activeGroupId !== list.groupId) {
+            error(403, $t("errors.this-list-is-not-part-of-your-active-group"));
+        }
+    }
+
+    const claimedQuantity = item.claims.reduce((a, { quantity }) => a + quantity, 0);
+    if (item.quantity !== null && claimedQuantity + updateData.data.quantity > item.quantity) {
+        error(
+            422,
+            $t("errors.could-not-claim-quantity-items", {
+                values: { quantity: updateData.data.quantity, availableQuantity: item.quantity - claimedQuantity }
+            })
+        );
+    }
+
+    try {
+        const data: Prisma.ItemClaimCreateInput = {
+            item: {
+                connect: {
+                    id: item.id
+                }
+            },
+            list: {
+                connect: {
+                    id: list.id
+                }
+            },
+            quantity: updateData.data.quantity
+        };
+
+        if (updateData.data.claimedById) {
+            data.claimedBy = {
+                connect: {
+                    id: updateData.data.claimedById
+                }
+            };
+        } else if (updateData.data.publicClaimedById) {
+            const unclaimToken = crypto.randomUUID();
+            data.publicClaimedBy = {
+                connect: {
+                    id: updateData.data.publicClaimedById
+                }
+            };
+            data.unclaimToken = unclaimToken;
+            data.unclaimTokenExpiresAt = new Date(Date.now() + publicUnclaimDays * 24 * 60 * 60 * 1000);
+        }
+
+        const createdClaim = await client.itemClaim.create({ data });
+        const updatedItem = await client.item.findUnique({
+            where: {
+                id: item.id
+            },
+            include: getItemInclusions()
+        });
+        if (updatedItem) itemEmitter.emit(ItemEvent.ITEM_UPDATE, updatedItem);
+
+        if (updateData.data.publicClaimedById) {
+            const publicUser = await client.systemUser.findUnique({
+                where: {
+                    id: updateData.data.publicClaimedById
+                },
+                select: {
+                    username: true
+                }
+            });
+            const unclaimUrl = `${env.ORIGIN || "http://localhost:5173"}/claims?claimId=${createdClaim.id}&token=${createdClaim.unclaimToken}`;
+
+            if (publicUser?.username) {
+                await sendClaimUnclaimLink(publicUser.username, unclaimUrl);
+            }
+
+            return new Response(
+                JSON.stringify({
+                    claimId: createdClaim.id,
+                    unclaimToken: createdClaim.unclaimToken,
+                    unclaimUrl
+                }),
+                {
+                    headers: {
+                        "content-type": "application/json"
+                    }
+                }
+            );
+        }
+
+        return new Response(null, { status: 200 });
+    } catch (err) {
+        logger.error({ err }, "Error claiming item");
+        error(422, $t("general.oops"));
+    }
+};

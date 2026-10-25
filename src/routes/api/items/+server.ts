@@ -8,6 +8,34 @@ import { getFormatter } from "$lib/server/i18n";
 import { requireLoginOrError } from "$lib/server/auth";
 import { logger } from "$lib/server/logger";
 
+async function cleanupPublicUsers(publicClaimedByIds: string[]) {
+    const uniqueIds = [...new Set(publicClaimedByIds.filter(Boolean))];
+    if (uniqueIds.length === 0) {
+        return;
+    }
+
+    await Promise.all(
+        uniqueIds.map(async (publicClaimedById) => {
+            const claimStillExists = await client.itemClaim.findFirst({
+                where: {
+                    publicClaimedById
+                },
+                select: {
+                    id: true
+                }
+            });
+
+            if (!claimStillExists) {
+                await client.systemUser.delete({
+                    where: {
+                        id: publicClaimedById
+                    }
+                });
+            }
+        })
+    );
+}
+
 export const DELETE: RequestHandler = async ({ url }) => {
     const $t = await getFormatter();
     const groupId = url.searchParams.get("groupId");
@@ -37,7 +65,8 @@ export const DELETE: RequestHandler = async ({ url }) => {
             claims: {
                 select: {
                     id: true,
-                    quantity: true
+                    quantity: true,
+                    publicClaimedById: true
                 }
             }
         },
@@ -50,6 +79,13 @@ export const DELETE: RequestHandler = async ({ url }) => {
                 }
             }
         }
+    });
+
+    const publicClaimedByIds = new Set<string>();
+    items.forEach((item) => {
+        item.claims.forEach((claim) => {
+            if (claim.publicClaimedById) publicClaimedByIds.add(claim.publicClaimedById);
+        });
     });
 
     const partiallyClaimedItems: typeof items = [];
@@ -140,6 +176,9 @@ export const DELETE: RequestHandler = async ({ url }) => {
                     itemsToUpdate.push({ id: item.id, quantity: item.quantity - claimedQty });
                 }
                 claimsToDelete = [...claimsToDelete, ...item.claims.map(({ id }) => id)];
+                item.claims.forEach((claim) => {
+                    if (claim.publicClaimedById) publicClaimedByIds.add(claim.publicClaimedById);
+                });
             });
             await client.$transaction(async (tx) => {
                 await tx.itemClaim.deleteMany({
@@ -163,6 +202,8 @@ export const DELETE: RequestHandler = async ({ url }) => {
                 );
             });
         }
+
+        await cleanupPublicUsers([...publicClaimedByIds]);
 
         return new Response(null, { status: 200 });
     } catch (err) {
