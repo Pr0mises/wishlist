@@ -1,4 +1,4 @@
-import { client } from "./prisma";
+import { client } from "$lib/server/prisma";
 
 const GLOBAL = "global";
 
@@ -20,6 +20,7 @@ enum ConfigKey {
     CLAIMS_SHOW_FOR_OWNER = "claims.showForOwner",
     CLAIMS_SHOW_NAME_PUBLIC = "claims.showNamePublic",
     CLAIMS_REQUIRE_EMAIL = "claims.requireEmail",
+    CLAIMS_PUBLIC_UNCLAIM_DAYS = "claims.publicUnclaimDays",
     LIST_MODE = "listMode",
     SECURITY_PASSWORD_STRENGTH = "security.passwordStrength",
     SECURITY_DISABLE_PASSWORD_LOGIN = "security.disablePasswordLogin",
@@ -67,6 +68,7 @@ const transformers: Record<ConfigKey, Transformer<unknown>> = {
     "claims.showForOwner": booleanTransformer,
     "claims.showNamePublic": booleanTransformer,
     "claims.requireEmail": booleanTransformer,
+    "claims.publicUnclaimDays": numberTransformer,
     listMode: stringTransformer,
     "security.passwordStrength": numberTransformer,
     "security.disablePasswordLogin": booleanTransformer,
@@ -102,7 +104,8 @@ const getDefaultConfig = (): Config => ({
         showNameAcrossGroups: false,
         showForOwner: false,
         showNamePublic: false,
-        requireEmail: true
+        requireEmail: false,
+        publicUnclaimDays: 365
     },
     listMode: "standard",
     security: {
