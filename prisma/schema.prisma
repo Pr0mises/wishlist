@@ -167,20 +167,23 @@ model ListItem {
 }
 
 model ItemClaim {
-    id                String      @id @unique @default(uuid())
-    item              Item        @relation(fields: [itemId], references: [id], onDelete: Cascade)
-    itemId            Int
-    list              List        @relation(fields: [listId], references: [id], onDelete: Cascade)
-    listId            String
-    claimedBy         User?       @relation(fields: [claimedById], references: [id], onDelete: Cascade)
-    claimedById       String?
-    publicClaimedBy   SystemUser? @relation(fields: [publicClaimedById], references: [id], onDelete: Cascade)
-    publicClaimedById String?
-    purchased         Boolean     @default(false)
-    quantity          Int         @default(1)
+    id                    String      @id @unique @default(uuid())
+    item                  Item        @relation(fields: [itemId], references: [id], onDelete: Cascade)
+    itemId                Int
+    list                  List        @relation(fields: [listId], references: [id], onDelete: Cascade)
+    listId                String
+    claimedBy             User?       @relation(fields: [claimedById], references: [id], onDelete: Cascade)
+    claimedById           String?
+    publicClaimedBy       SystemUser? @relation(fields: [publicClaimedById], references: [id], onDelete: Cascade)
+    publicClaimedById     String?
+    unclaimToken          String?     @unique @default(uuid())
+    unclaimTokenExpiresAt DateTime?
+    purchased             Boolean     @default(false)
+    quantity              Int         @default(1)
 
     @@index([itemId])
     @@index([claimedById])
+    @@index([publicClaimedById])
     @@map("list_item_claim")
 }
 
