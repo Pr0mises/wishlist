@@ -84,6 +84,15 @@ const sendEmail = async (options: Mail.Options) => {
         });
 };
 
+export const sendClaimUnclaimLink = async (to: string, link: string) => {
+    const $t = await getFormatter();
+    return await sendEmail({
+        to,
+        subject: $t("wishes.unclaim-link"),
+        text: `${$t("wishes.unclaim-link")}: ${link}`
+    });
+};
+
 export const sendSignupLink = async (to: string, inviteUrl: string) => {
     const $t = await getFormatter();
     const html = inviteTempl({
